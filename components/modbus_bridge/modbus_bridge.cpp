@@ -50,6 +50,7 @@ namespace esphome
     static uint32_t g_drops_tcp_len = 0;
     static uint32_t g_drops_rtu_incomplete = 0;
     static uint32_t g_drops_rtu_crc = 0;
+    static uint32_t g_drops_rtu_mismatch = 0;
     static uint32_t g_drop_untrusted_reads = 0;
     static uint32_t g_drop_untrusted_writes = 0;
     static uint32_t g_reject_untrusted_clients = 0;
@@ -197,6 +198,24 @@ namespace esphome
       case 0x02:
       case 0x03:
       case 0x04:
+        return true;
+      default:
+        return false;
+      }
+    }
+
+    static inline bool has_known_response_shape_(uint8_t fc)
+    {
+      switch (fc)
+      {
+      case 0x01:
+      case 0x02:
+      case 0x03:
+      case 0x04:
+      case 0x05:
+      case 0x06:
+      case 0x0F:
+      case 0x10:
         return true;
       default:
         return false;
@@ -724,10 +743,10 @@ namespace esphome
             for (auto &cl : this->clients_) if (cl.fd >= 0) clients_active++;
         #endif
         ESP_LOGD(TAG,
-                "stats: in=%u out=%u drops(pid)=%u drops(tcp_len)=%u drops(rtu_incomplete)=%u drops(rtu_crc)=%u drop_untrusted_reads=%u drop_untrusted_writes=%u reject_untrusted_clients=%u timeouts=%u clients_active=%u clients_total=%u noslot=%u preempt=%u",
+                "stats: in=%u out=%u drops(pid)=%u drops(tcp_len)=%u drops(rtu_incomplete)=%u drops(rtu_crc)=%u drops(rtu_mismatch)=%u drop_untrusted_reads=%u drop_untrusted_writes=%u reject_untrusted_clients=%u timeouts=%u clients_active=%u clients_total=%u noslot=%u preempt=%u",
                 (unsigned)g_frames_in, (unsigned)g_frames_out, (unsigned)g_drops_pid,
                 (unsigned)g_drops_tcp_len, (unsigned)g_drops_rtu_incomplete,
-                (unsigned)g_drops_rtu_crc,
+                (unsigned)g_drops_rtu_crc, (unsigned)g_drops_rtu_mismatch,
                 (unsigned)g_drop_untrusted_reads, (unsigned)g_drop_untrusted_writes,
                 (unsigned)g_reject_untrusted_clients, (unsigned)g_timeouts,
                 (unsigned)clients_active, (unsigned)g_clients_connected,
@@ -1561,6 +1580,17 @@ namespace esphome
           this->finish_current_and_send_next_();
           return;
         }
+        if (!this->validate_rtu_response_matches_request_(pending))
+        {
+          INC(g_drops_rtu_mismatch);
+          ESP_LOGW(TAG, "RTU response does not match request. Dropping response. client_id=%d req_uid=%u req_fc=0x%02X bytes=%s",
+                   pending.client_fd,
+                   pending.rtu_data.size() > 0 ? (unsigned)pending.rtu_data[0] : 0U,
+                   pending.rtu_data.size() > 1 ? pending.rtu_data[1] : 0,
+                   to_hex(pending.response).c_str());
+          this->finish_current_and_send_next_();
+          return;
+        }
         // Bridge-global event: RTU frame received (request context)
         {
           uint8_t fc = pdu_fc_from_rtu_(pending.rtu_data);
@@ -1642,6 +1672,33 @@ namespace esphome
       return calculated == received;
     }
 
+    bool ModbusBridgeComponent::validate_rtu_response_matches_request_(const PendingRequest &pending) const
+    {
+      const auto &response = pending.response;
+      if (pending.rtu_data.size() < 2 || response.size() < 5)
+        return false;
+
+      const uint8_t request_uid = pending.rtu_data[0];
+      const uint8_t request_fc = pending.rtu_data[1];
+      const uint8_t response_uid = response[0];
+      const uint8_t response_fc = response[1];
+
+      if (response_uid != request_uid)
+        return false;
+      if (response_fc != request_fc && response_fc != (request_fc | 0x80))
+        return false;
+
+      size_t expected_len = 0;
+      if (expected_known_rtu_response_length_(pending, 0, &expected_len))
+        return expected_len == response.size();
+      if (has_known_response_shape_(request_fc))
+        return false;
+
+      // Unknown function codes stay transparent; after UID/FC and CRC checks,
+      // there is no response layout we can safely validate further.
+      return true;
+    }
+
     bool ModbusBridgeComponent::normalize_rtu_response_(PendingRequest &pending)
     {
       auto &response = pending.response;
@@ -1718,6 +1775,7 @@ namespace esphome
     uint32_t ModbusBridgeComponent::get_drops_tcp_len() const { return g_drops_tcp_len; }
     uint32_t ModbusBridgeComponent::get_drops_rtu_incomplete() const { return g_drops_rtu_incomplete; }
     uint32_t ModbusBridgeComponent::get_drops_rtu_crc() const { return g_drops_rtu_crc; }
+    uint32_t ModbusBridgeComponent::get_drops_rtu_mismatch() const { return g_drops_rtu_mismatch; }
     uint32_t ModbusBridgeComponent::get_drop_untrusted_reads() const { return g_drop_untrusted_reads; }
     uint32_t ModbusBridgeComponent::get_drop_untrusted_writes() const { return g_drop_untrusted_writes; }
     uint32_t ModbusBridgeComponent::get_reject_untrusted_clients() const { return g_reject_untrusted_clients; }

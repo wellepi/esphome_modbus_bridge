@@ -4,6 +4,7 @@ This ESPHome component provides a transparent Modbus TCP-to-RTU bridge for ESP82
 
 | Version | Changes |
 |---|---|
+| 2026.06.1 | Drop RTU responses that have valid CRC but do not match the active request |
 | 2026.04.3 | Added CRC-validated RTU echo/noise stripping for known response types |
 | 2026.04.2 | Added RTU response CRC validation before forwarding TCP responses |
 | 2026.04.1 | Added optional protection for untrusted clients using `trusted_networks` and `trusted_hosts` |
@@ -37,6 +38,7 @@ The bridge listens on a configurable TCP port (default: 502) and expects standar
 - Supports RS-485 transceivers with separate `DE`/`RE` pins or one shared GPIO
 - Validates RTU response CRC before forwarding responses to TCP clients
 - Strips RTU echo/noise when a valid matching response frame can be recovered
+- Drops stale RTU responses that do not match the currently active request
 - Optional write protection for clients outside trusted networks or trusted DNS hosts
 - Optional read protection for clients outside trusted networks or trusted DNS hosts
 - Optional rejection of untrusted TCP clients before Modbus traffic starts
@@ -45,6 +47,8 @@ The bridge listens on a configurable TCP port (default: 502) and expects standar
 - Integrates easily with Home Assistant and ESPHome automations
 
 Runtime counters and the related example sensors are aggregated across all configured `modbus_bridge` instances on the same ESP node. They are intended as node-wide diagnostics, not per-bridge counters.
+
+Since version `2026.06.1`, RTU responses are checked against the active request after CRC validation. The bridge verifies matching Unit ID, matching Function Code (or Modbus exception Function Code), and for known response types also the exact expected response length. This prevents stale valid-CRC RTU frames from being forwarded as the response to a newer TCP request. Dropped frames are counted as `RTU Mismatch Drops`.
 
 #### Proven Compatibility
 - [nilan-cts600-homeassistant](https://github.com/frodef/nilan-cts600-homeassistant) thanks to @RichardIstSauer
@@ -339,6 +343,13 @@ sensor:
     update_interval: 10s
     lambda: |-
       return (int) id(mb_bridge).get_drops_rtu_crc();
+
+  - platform: template
+    name: "RTU Mismatch Drops"
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      return (int) id(mb_bridge).get_drops_rtu_mismatch();
 
   - platform: template
     name: "TCP Untrusted Read Drops"
