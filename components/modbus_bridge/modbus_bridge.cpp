@@ -157,6 +157,11 @@ namespace esphome
 
     using FrameHandler = std::function<void(const uint8_t *, size_t, int)>;
 
+    static inline uint16_t transaction_id_from_header_(const uint8_t header[7])
+    {
+      return (static_cast<uint16_t>(header[0]) << 8) | header[1];
+    }
+
     // Build Modbus TCP response from an RTU response
     static inline void build_tcp_from_rtu(const PendingRequest &pending,
                                           const std::vector<uint8_t> &rtu_resp,
@@ -968,7 +973,8 @@ namespace esphome
           seconds_ago = (now - last) / 1000.0f;
         }
         // req.rtu_data[1] is the function code (UID at [0], FC at [1])
-        ESP_LOGD(TAG, "TCP->RTU UID: %d, FC: 0x%02X, LEN: %d (client_id=%d, last activity %.3f s ago)",
+        ESP_LOGD(TAG, "TCP->RTU TID: 0x%04X, UID: %d, FC: 0x%02X, LEN: %d (client_id=%d, last activity %.3f s ago)",
+                 transaction_id_from_header_(data),
                  uid,
                  req.rtu_data.size() > 1 ? req.rtu_data[1] : 0,
                  modbus_len, client_fd, seconds_ago);
@@ -1447,7 +1453,8 @@ namespace esphome
 
       if (this->debug_)
       {
-        ESP_LOGD(TAG, "RTU send: %s client_id=%d", to_hex(req.rtu_data).c_str(), req.client_fd);
+        ESP_LOGD(TAG, "RTU send: %s client_id=%d tid=0x%04X",
+                 to_hex(req.rtu_data).c_str(), req.client_fd, transaction_id_from_header_(req.header));
       }
 
       uint8_t fc = pdu_fc_from_rtu_(req.rtu_data);
@@ -1603,7 +1610,10 @@ namespace esphome
         {
           std::string tcp_debug = to_hex(tcp_response);
           //ESP_LOGD(TAG, "RTU->TCP response: %s", tcp_debug.c_str());
-          ESP_LOGD(TAG, "Response time: %ums", millis() - pending.start_time);
+          ESP_LOGD(TAG, "RTU->TCP TID: 0x%04X, LEN: %u, Response time: %ums",
+                   transaction_id_from_header_(pending.header),
+                   tcp_response.size() >= 6 ? static_cast<unsigned>((tcp_response[4] << 8) | tcp_response[5]) : 0U,
+                   millis() - pending.start_time);
         }
         this->send_to_client_(pending.client_fd, tcp_response.data(), tcp_response.size());
         g_frames_out++;
