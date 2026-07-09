@@ -4,6 +4,7 @@ This ESPHome component provides a transparent Modbus TCP-to-RTU bridge for ESP82
 
 | Version | Changes |
 |---|---|
+| 2026.07.1 | Fixed request queue handling and improved untrusted-client, TCP-send, and RTU-response handling |
 | 2026.06.1 | Drop RTU responses that have valid CRC but do not match the active request |
 | 2026.04.3 | Added CRC-validated RTU echo/noise stripping for known response types |
 | 2026.04.2 | Added RTU response CRC validation before forwarding TCP responses |
@@ -39,7 +40,7 @@ The bridge listens on a configurable TCP port (default: 502) and expects standar
 - Validates RTU response CRC before forwarding responses to TCP clients
 - Strips RTU echo/noise when a valid matching response frame can be recovered
 - Drops stale RTU responses that do not match the currently active request
-- Optional write protection for clients outside trusted networks or trusted DNS hosts
+- Optional write protection that allows untrusted clients to use only standard read-only functions `0x01`-`0x04`
 - Optional read protection for clients outside trusted networks or trusted DNS hosts
 - Optional rejection of untrusted TCP clients before Modbus traffic starts
 - Can run multiple bridges in one node (for multiple UART buses)
@@ -49,6 +50,8 @@ The bridge listens on a configurable TCP port (default: 502) and expects standar
 Runtime counters and the related example sensors are aggregated across all configured `modbus_bridge` instances on the same ESP node. They are intended as node-wide diagnostics, not per-bridge counters.
 
 Since version `2026.06.1`, RTU responses are checked against the active request after CRC validation. The bridge verifies matching Unit ID, matching Function Code (or Modbus exception Function Code), and for known response types also the exact expected response length. This prevents stale valid-CRC RTU frames from being forwarded as the response to a newer TCP request. Dropped frames are counted as `RTU Mismatch Drops`.
+
+When read or write protection is active, untrusted clients are limited to two pending requests, UID `0` broadcasts are dropped, and queued requests from trusted clients are handled before queued untrusted requests. The currently active RTU request is never interrupted.
 
 #### Proven Compatibility
 - [nilan-cts600-homeassistant](https://github.com/frodef/nilan-cts600-homeassistant) thanks to @RichardIstSauer
@@ -184,7 +187,7 @@ modbus_bridge:
   tcp_port: 502                  # TCP port to listen on
   # rtu_response_timeout: 1000    # ms, internally clamped to >=10 ms
   # tcp_client_timeout: 60000    # ms of inactivity before client is disconnected
-  # tcp_allowed_clients: 2       # number of simultaneous TCP clients (min 1)
+  # tcp_allowed_clients: 2       # number of simultaneous TCP clients (1-8)
   # tcp_poll_interval: 50        # ms between TCP polls
   # de_pin: GPIO18               # Optional: RS-485 Driver Enable (DE)
   # re_pin: GPIO19               # Optional: RS-485 Receiver Enable (/RE) - de_pin and re_pin can be the same GPIO
@@ -195,9 +198,9 @@ modbus_bridge:
   # Without trusted_networks or trusted_hosts, the options below keep their state
   # but do not block reads, writes, or client connections.
 
-  # reject_untrusted_clients: false            # only effective together with trusted_networks or trusted_hosts
+  # reject_untrusted_clients: false              # only effective together with trusted_networks or trusted_hosts
   # protect_reads_for_untrusted_clients: false   # only effective together with trusted_networks or trusted_hosts
-  # protect_writes_for_untrusted_clients: false  # only effective together with trusted_networks or trusted_hosts
+  # protect_writes_for_untrusted_clients: false  # allows untrusted clients only FC 0x01-0x04 when enabled
   # reject_untrusted_clients_switch:
   #   name: "Reject Untrusted Clients"
   # protect_untrusted_reads_switch:
@@ -208,7 +211,7 @@ modbus_bridge:
   #   - 192.168.1.0/24          # local LAN stays trusted
   #   - 10.0.0.5/32              # single trusted client
   # trusted_hosts:
-  #   - otherhouse.example.org   # optional: trusted remote DynDNS/static host; resolved on new connections only
+  #   - otherhouse.example.org   # optional: trusted remote DynDNS/static host; DNS results are cached for 60s
 
   # Event: triggered whenever number of TCP clients changes
   on_tcp_clients_changed:
@@ -364,6 +367,13 @@ sensor:
     update_interval: 10s
     lambda: |-
       return (int) id(mb_bridge).get_drop_untrusted_writes();
+
+  - platform: template
+    name: "TCP Untrusted Queue Drops"
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      return (int) id(mb_bridge).get_drop_untrusted_queue();
 
   - platform: template
     name: "TCP Untrusted Rejects"

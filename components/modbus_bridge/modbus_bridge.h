@@ -84,12 +84,14 @@ namespace esphome
     struct PendingRequest
     {
       // TCP-side identification
-      int client_fd; // client slot index (not a real fd); used to map response back to the TCP client
+      // A negative slot marks an in-flight RTU request whose TCP client disconnected.
+      int client_fd{-1}; // client slot index (not a real fd); used to map response back to the TCP client
 
       // Payload data
       uint8_t header[7];
       std::vector<uint8_t> response;
       std::vector<uint8_t> rtu_data;
+      bool trusted_client{true};
 
       // Timing
       uint32_t start_time = 0;
@@ -117,6 +119,8 @@ namespace esphome
       {
         if (allowed < 1)
           allowed = 1;
+        if (allowed > 8)
+          allowed = 8;
         tcp_allowed_clients_ = allowed;
       }
       void set_crc_bytes_swapped(bool swapped) { crc_bytes_swapped_ = swapped; }
@@ -141,6 +145,7 @@ namespace esphome
       uint32_t get_drops_rtu_mismatch() const;
       uint32_t get_drop_untrusted_reads() const;
       uint32_t get_drop_untrusted_writes() const;
+      uint32_t get_drop_untrusted_queue() const;
       uint32_t get_reject_untrusted_clients() const;
       uint32_t get_timeouts() const;
       uint32_t get_clients_connected_total() const;
@@ -193,6 +198,9 @@ namespace esphome
       RejectUntrustedClientsSwitch *reject_untrusted_clients_switch_{nullptr};
       std::vector<TrustedNetwork> trusted_networks_;
       std::vector<std::string> trusted_hosts_;
+      std::vector<uint32_t> trusted_host_ipv4_cache_;
+      uint32_t trusted_hosts_last_resolve_{0};
+      bool trusted_hosts_resolved_{false};
 
       bool polling_active_{false};
 
@@ -243,13 +251,14 @@ namespace esphome
       bool is_read_protection_effective_() const;
       bool is_write_protection_effective_() const;
       bool is_reject_untrusted_clients_effective_() const;
-      bool is_trusted_client_ipv4_(uint32_t remote_ipv4) const;
+      bool is_trusted_client_ipv4_(uint32_t remote_ipv4);
+      void refresh_trusted_host_cache_();
       void send_rtu_request_(PendingRequest &req);
       bool finish_current_and_send_next_();
       void fire_rtu_timeout_for_request_(const PendingRequest &req);
       void read_uart_response_bytes_(PendingRequest &req);
       void handle_tcp_payload(const uint8_t *data, size_t len, int client_fd);
-      void send_to_client_(int slot, const uint8_t *data, size_t len);
+      bool send_to_client_(int slot, const uint8_t *data, size_t len);
       void purge_client_(size_t idx, std::vector<std::vector<uint8_t>> *accu_opt);
 
       // RS-485 helpers (no-ops when neither DE nor /RE pin is set)
