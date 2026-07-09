@@ -30,18 +30,15 @@ namespace esphome
 
     // Runtime-configurable (no build flags needed)
     static constexpr size_t kMaxPendingRequests = 32;
-    static constexpr size_t kTcpAccuCap = 1024;
-    static constexpr size_t kTcpAccuCap8266 = 1024;
+    static constexpr uint16_t MODBUS_TCP_LEN_CAP = 260;            // UID+PDU (LEN field)
+    static constexpr size_t MAX_TCP_READ = 6 + MODBUS_TCP_LEN_CAP; // MBAP(6) + LEN
+    static constexpr size_t kTcpAccuCap = 2 * MAX_TCP_READ;        // partial frame + next TCP read
     static constexpr size_t kMaxFramesPerLoop = 8;
     static constexpr size_t kMaxPendingRequestsPerUntrustedClient = 2;
     static constexpr uint32_t kTcpSendTimeoutMs = 10;
     static constexpr uint32_t kTrustedHostCacheMs = 60000;
     // Runtime toggle: preempt oldest same-IP connection when full
     static bool kPreemptSameIP = true;
-
-    // Centralized caps
-    static constexpr uint16_t MODBUS_TCP_LEN_CAP = 260;            // UID+PDU (LEN field)
-    static constexpr size_t MAX_TCP_READ = 6 + MODBUS_TCP_LEN_CAP; // MBAP(6) + LEN
 
     // Lightweight runtime counters aggregated across all bridge instances on the node.
     // This is intentional so diagnostics can reflect total bridge activity even when
@@ -792,6 +789,7 @@ namespace esphome
       // Use a fixed-size scratch buffer for TCP reads (independent of UART RX size)
       // One full Modbus-TCP frame (MBAP + LEN)
       this->temp_buffer_.resize(MAX_TCP_READ);
+      this->tcp_response_buffer_.reserve(MAX_TCP_READ);
       this->rtu_poll_interval_ms_ = this->rtu_inactivity_timeout_ms_ + 2;
       this->stop_uart_polling_();
       this->tcp_client_count_ = 0;
@@ -1105,10 +1103,6 @@ namespace esphome
       }
 
       memcpy(req.header, data, 7);
-      {
-        size_t rx_cap = this->uart_->get_rx_buffer_size();
-        req.response.reserve(std::max<size_t>(rx_cap, 256));
-      }
       req.start_time = 0;
       req.last_size = 0; // ensure deterministic timeout logic
       req.stable_polls = 0;
@@ -1197,7 +1191,7 @@ namespace esphome
       }
 
       // Ensure accumulator size tracks clients_ size and reserve capacity
-      this->prepare_rx_accumulator_(this->rx_accu8266_, this->clients_.size(), kTcpAccuCap8266);
+      this->prepare_rx_accumulator_(this->rx_accu8266_, this->clients_.size(), kTcpAccuCap);
 
       const size_t free_idx = find_first_slot_(this->clients_.size(), [&](size_t idx)
       {
@@ -1236,8 +1230,8 @@ namespace esphome
         client.trusted = trusted;
         this->clients_.push_back(client);
         this->rx_accu8266_.emplace_back();
-        if (this->rx_accu8266_.back().capacity() < kTcpAccuCap8266)
-          this->rx_accu8266_.back().reserve(kTcpAccuCap8266);
+        if (this->rx_accu8266_.back().capacity() < kTcpAccuCap)
+          this->rx_accu8266_.back().reserve(kTcpAccuCap);
         this->clients_.back().disconnect_notified = false;
         ESP_LOGI(TAG, "TCP connect %s:%u client_id=%d trusted=%s",
                  ipv4_to_cstr_(remote_ipv4, ipbuf, sizeof(ipbuf)), (unsigned)remote_port,
@@ -1400,7 +1394,7 @@ namespace esphome
       {
         return; // Do not accept or process any TCP traffic while disabled
       }
-      this->prepare_rx_accumulator_(this->rx_accu8266_, this->clients_.size(), kTcpAccuCap8266);
+      this->prepare_rx_accumulator_(this->rx_accu8266_, this->clients_.size(), kTcpAccuCap);
       if (this->sock_ < 0)
       {
         for (auto &v : this->rx_accu8266_)
@@ -1447,7 +1441,7 @@ namespace esphome
           if (r > 0)
           {
             int client_fd = static_cast<int>(std::distance(this->clients_.begin(), it));
-            this->handle_client_rx_chunk_(this->rx_accu8266_[client_fd], client_fd, this->temp_buffer_.data(), static_cast<size_t>(r), kTcpAccuCap8266);
+            this->handle_client_rx_chunk_(this->rx_accu8266_[client_fd], client_fd, this->temp_buffer_.data(), static_cast<size_t>(r), kTcpAccuCap);
             this->clients_[client_fd].disconnect_notified = false; // receiving traffic confirms connection
             it->last_activity = millis();
           }
@@ -1515,8 +1509,8 @@ namespace esphome
         }
       }
 
-      // Small timeout to yield to lwIP / logger and avoid starvation when logs are streaming
-      struct timeval timeout = {0, 2000}; // 2 ms
+      // This method is already called periodically; do not block the ESPHome loop.
+      struct timeval timeout = {0, 0};
       int sel = lwip_select(maxfd + 1, &read_fds, NULL, NULL, &timeout);
       if (sel < 0)
         return;
@@ -1584,6 +1578,12 @@ namespace esphome
 
     void ModbusBridgeComponent::send_rtu_request_(PendingRequest &req)
     {
+      req.response.clear();
+      if (req.response.capacity() < MAX_TCP_READ)
+        req.response.reserve(MAX_TCP_READ);
+      req.last_size = 0;
+      req.stable_polls = 0;
+
       this->uart_->flush();
       drain_uart_rx(this->uart_);
       this->rs485_begin_tx_();
@@ -1722,7 +1722,9 @@ namespace esphome
             ESP_LOGD(TAG, "RTU recv (stable %u polls, %d bytes): %s",
                      (unsigned)pending.stable_polls, (int)current_size, debug_output.c_str());
         }
-        this->normalize_rtu_response_(pending);
+        bool crc_valid = complete_known_frame;
+        if (!complete_known_frame && this->normalize_rtu_response_(pending))
+          crc_valid = true; // normalization only accepts a frame with valid CRC
         current_size = pending.response.size();
         if (current_size < 5)
         {
@@ -1731,7 +1733,9 @@ namespace esphome
           this->finish_current_and_send_next_();
           return;
         }
-        if (!this->validate_rtu_crc_(pending.response))
+        if (!crc_valid)
+          crc_valid = this->validate_rtu_crc_(pending.response);
+        if (!crc_valid)
         {
           INC(g_drops_rtu_crc);
           ESP_LOGW(TAG, "RTU CRC mismatch. Dropping response. client_id=%d bytes=%s",
@@ -1758,7 +1762,7 @@ namespace esphome
         }
         if (this->is_client_slot_connected_(pending.client_fd))
         {
-          std::vector<uint8_t> tcp_response;
+          auto &tcp_response = this->tcp_response_buffer_;
           build_tcp_from_rtu(pending, pending.response, tcp_response);
           if (this->send_to_client_(pending.client_fd, tcp_response.data(), tcp_response.size()))
           {
