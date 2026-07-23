@@ -1886,7 +1886,7 @@ namespace esphome
               ESP_LOGD(TAG, "RTU->TCP TID: 0x%04X, LEN: %u, Response time: %ums",
                        transaction_id_from_header_(pending.header),
                        tcp_response.size() >= 6 ? static_cast<unsigned>((tcp_response[4] << 8) | tcp_response[5]) : 0U,
-                       millis() - pending.start_time);
+                       static_cast<unsigned>(millis() - pending.start_time));
             }
           }
         }
