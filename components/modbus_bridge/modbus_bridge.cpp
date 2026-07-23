@@ -19,6 +19,7 @@
 #include "modbus_bridge.h"
 #include "esphome/core/log.h"
 #include "esphome/core/hal.h"
+#include "esphome/core/version.h"
 #include "esphome/components/network/util.h"
 
 namespace esphome
@@ -30,9 +31,10 @@ namespace esphome
 
     // Runtime-configurable (no build flags needed)
     static constexpr size_t kMaxPendingRequests = 32;
-    static constexpr uint16_t MODBUS_TCP_LEN_CAP = 260;            // UID+PDU (LEN field)
+    static constexpr uint16_t MODBUS_TCP_LEN_CAP = 254;            // UID(1) + max PDU(253)
     static constexpr size_t MAX_TCP_READ = 6 + MODBUS_TCP_LEN_CAP; // MBAP(6) + LEN
     static constexpr size_t kTcpAccuCap = 2 * MAX_TCP_READ;        // partial frame + next TCP read
+    static constexpr size_t kMaxRtuCapture = 512;                  // max RTU echo + response
     static constexpr size_t kMaxFramesPerLoop = 8;
     static constexpr size_t kMaxPendingRequestsPerUntrustedClient = 2;
     static constexpr uint32_t kTcpSendTimeoutMs = 10;
@@ -114,6 +116,41 @@ namespace esphome
       uint8_t b;
       while (u && u->available())
         u->read_byte(&b);
+    }
+
+    enum class BridgeUartFlushResult : uint8_t
+    {
+      SUCCESS,
+      TIMEOUT,
+      FAILED,
+    };
+
+    static inline BridgeUartFlushResult flush_uart_tx_(uart::UARTComponent *uart_component)
+    {
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2026, 4, 0)
+      const auto result = uart_component->flush();
+      if (result == uart::UARTFlushResult::UART_FLUSH_RESULT_SUCCESS ||
+          result == uart::UARTFlushResult::UART_FLUSH_RESULT_ASSUMED_SUCCESS)
+        return BridgeUartFlushResult::SUCCESS;
+      if (result == uart::UARTFlushResult::UART_FLUSH_RESULT_TIMEOUT)
+        return BridgeUartFlushResult::TIMEOUT;
+      return BridgeUartFlushResult::FAILED;
+#elif ESPHOME_VERSION_CODE >= VERSION_CODE(2026, 3, 0)
+      const auto result = uart_component->flush();
+      if (result == uart::FlushResult::SUCCESS || result == uart::FlushResult::ASSUMED_SUCCESS)
+        return BridgeUartFlushResult::SUCCESS;
+      if (result == uart::FlushResult::TIMEOUT)
+        return BridgeUartFlushResult::TIMEOUT;
+      return BridgeUartFlushResult::FAILED;
+#else
+      uart_component->flush();
+      return BridgeUartFlushResult::SUCCESS;
+#endif
+    }
+
+    static inline const char *flush_result_to_cstr_(BridgeUartFlushResult result)
+    {
+      return result == BridgeUartFlushResult::TIMEOUT ? "timeout" : "driver failure";
     }
 
     // Extracts Modbus PDU function code from an RTU frame (UID + PDU + CRC)
@@ -211,6 +248,25 @@ namespace esphome
         return true;
       default:
         return false;
+      }
+    }
+
+    static inline bool write_response_echo_matches_request_(const PendingRequest &pending)
+    {
+      if (pending.rtu_data.size() < 6 || pending.response.size() < 6)
+        return false;
+
+      switch (pending.rtu_data[1])
+      {
+      case 0x05:
+      case 0x06:
+      case 0x0F:
+      case 0x10:
+        // Standard write responses echo start address plus value or quantity.
+        return std::equal(pending.rtu_data.begin() + 2, pending.rtu_data.begin() + 6,
+                          pending.response.begin() + 2);
+      default:
+        return true;
       }
     }
 
@@ -424,7 +480,7 @@ namespace esphome
     {
       int processed = 0;
       size_t offset = 0;
-      // defensive cap for Modbus-TCP LEN (UID+PDU); typical max ~260
+      // Defensive cap for Modbus-TCP LEN (UID + PDU).
       while (accu.size() >= offset + 7)
       {
         if (processed++ >= (int)kMaxFramesPerLoop)
@@ -1124,8 +1180,15 @@ namespace esphome
       if (start_immediately)
       {
         PendingRequest &cur = this->pending_requests_.front();
-        this->send_rtu_request_(cur);
-        this->start_uart_polling_();
+        if (this->send_rtu_request_(cur))
+        {
+          if (!this->pending_requests_.empty())
+            this->start_uart_polling_();
+        }
+        else
+        {
+          this->abort_pending_after_uart_tx_failure_();
+        }
       }
     }
 
@@ -1576,7 +1639,7 @@ namespace esphome
       return this->clients_[slot].trusted;
     }
 
-    void ModbusBridgeComponent::send_rtu_request_(PendingRequest &req)
+    bool ModbusBridgeComponent::send_rtu_request_(PendingRequest &req)
     {
       req.response.clear();
       if (req.response.capacity() < MAX_TCP_READ)
@@ -1584,12 +1647,26 @@ namespace esphome
       req.last_size = 0;
       req.stable_polls = 0;
 
-      this->uart_->flush();
+      BridgeUartFlushResult flush_result = flush_uart_tx_(this->uart_);
+      if (flush_result != BridgeUartFlushResult::SUCCESS)
+      {
+        ESP_LOGE(TAG, "UART flush %s before RTU send. client_id=%d tid=0x%04X",
+                 flush_result_to_cstr_(flush_result), req.client_fd,
+                 transaction_id_from_header_(req.header));
+        return false;
+      }
       drain_uart_rx(this->uart_);
       this->rs485_begin_tx_();
       this->uart_->write_array(req.rtu_data);
-      this->uart_->flush();
+      flush_result = flush_uart_tx_(this->uart_);
       this->rs485_end_tx_();
+      if (flush_result != BridgeUartFlushResult::SUCCESS)
+      {
+        ESP_LOGE(TAG, "UART flush %s after RTU write; transmission may be incomplete. client_id=%d tid=0x%04X",
+                 flush_result_to_cstr_(flush_result), req.client_fd,
+                 transaction_id_from_header_(req.header));
+        return false;
+      }
       req.start_time = millis();
 
       if (this->debug_)
@@ -1601,6 +1678,16 @@ namespace esphome
       uint8_t fc = pdu_fc_from_rtu_(req.rtu_data);
       uint16_t addr = start_addr_from_rtu_(req.rtu_data);
       this->rtu_send_cb_.call((int)fc, (int)addr);
+      return true;
+    }
+
+    void ModbusBridgeComponent::abort_pending_after_uart_tx_failure_()
+    {
+      const size_t dropped = this->pending_requests_.size();
+      this->pending_requests_.clear();
+      this->stop_uart_polling_();
+      drain_uart_rx(this->uart_);
+      ESP_LOGW(TAG, "Aborted %u pending Modbus request(s) after UART TX failure", (unsigned)dropped);
     }
 
     bool ModbusBridgeComponent::finish_current_and_send_next_()
@@ -1616,7 +1703,17 @@ namespace esphome
           this->pending_requests_.pop_front();
           continue;
         }
-        this->send_rtu_request_(next);
+        if (!this->send_rtu_request_(next))
+        {
+          this->abort_pending_after_uart_tx_failure_();
+          return false;
+        }
+        if (this->pending_requests_.empty())
+        {
+          // An on_rtu_send automation may disable the bridge and clear the queue.
+          this->stop_uart_polling_();
+          return false;
+        }
         return true;
       }
 
@@ -1631,20 +1728,31 @@ namespace esphome
       this->rtu_timeout_cb_.call((int)fc, (int)addr);
     }
 
-    void ModbusBridgeComponent::read_uart_response_bytes_(PendingRequest &req)
+    size_t ModbusBridgeComponent::read_uart_response_bytes_(PendingRequest &req)
     {
       size_t avail = this->uart_->available();
       if (!avail)
-        return;
-      req.response.reserve(req.response.size() + avail);
+        return 0;
+
+      const size_t remaining = req.response.size() < kMaxRtuCapture
+                                   ? kMaxRtuCapture - req.response.size()
+                                   : 0;
+      req.response.reserve(req.response.size() + std::min(avail, remaining));
+      size_t discarded = 0;
       for (size_t i = 0; i < avail; ++i)
       {
         uint8_t b;
         if (this->uart_->read_byte(&b))
-          req.response.push_back(b);
+        {
+          if (req.response.size() < kMaxRtuCapture)
+            req.response.push_back(b);
+          else
+            discarded++;
+        }
         else
           break;
       }
+      return discarded;
     }
 
     void ModbusBridgeComponent::start_uart_polling_()
@@ -1673,7 +1781,17 @@ namespace esphome
       }
       PendingRequest &pending = this->pending_requests_.front();
 
-      this->read_uart_response_bytes_(pending);
+      const size_t discarded = this->read_uart_response_bytes_(pending);
+      if (discarded > 0)
+      {
+        INC(g_drops_rtu_incomplete);
+        ESP_LOGW(TAG,
+                 "RTU response exceeded capture limit (%u bytes, at least %u discarded). Dropping. client_id=%d bytes=%s",
+                 (unsigned)kMaxRtuCapture, (unsigned)discarded, pending.client_fd,
+                 to_hex(pending.response).c_str());
+        this->finish_current_and_send_next_();
+        return;
+      }
 
       size_t current_size = pending.response.size();
 
@@ -1754,12 +1872,8 @@ namespace esphome
           this->finish_current_and_send_next_();
           return;
         }
-        // Bridge-global event: RTU frame received (request context)
-        {
-          uint8_t fc = pdu_fc_from_rtu_(pending.rtu_data);
-          uint16_t addr = start_addr_from_rtu_(pending.rtu_data);
-          this->rtu_receive_cb_.call((int)fc, (int)addr);
-        }
+        const uint8_t event_fc = pdu_fc_from_rtu_(pending.rtu_data);
+        const uint16_t event_addr = start_addr_from_rtu_(pending.rtu_data);
         if (this->is_client_slot_connected_(pending.client_fd))
         {
           auto &tcp_response = this->tcp_response_buffer_;
@@ -1781,6 +1895,9 @@ namespace esphome
           ESP_LOGD(TAG, "Discarding RTU response for disconnected client, TID: 0x%04X",
                    transaction_id_from_header_(pending.header));
         }
+        // Run automations only after all request data has been consumed. An
+        // automation may disable the bridge and clear pending_requests_.
+        this->rtu_receive_cb_.call((int)event_fc, (int)event_addr);
         this->finish_current_and_send_next_();
         return;
       }
@@ -1864,7 +1981,13 @@ namespace esphome
 
       size_t expected_len = 0;
       if (expected_known_rtu_response_length_(pending, 0, &expected_len))
-        return expected_len == response.size();
+      {
+        if (expected_len != response.size())
+          return false;
+        if (response_fc == (request_fc | 0x80))
+          return true;
+        return write_response_echo_matches_request_(pending);
+      }
       if (has_known_response_shape_(request_fc))
         return false;
 

@@ -39,7 +39,7 @@ The bridge listens on a configurable TCP port (default: 502) and expects standar
 - Supports RS-485 transceivers with separate `DE`/`RE` pins or one shared GPIO
 - Validates RTU response CRC before forwarding responses to TCP clients
 - Strips RTU echo/noise when a valid matching response frame can be recovered
-- Drops stale RTU responses that do not match the currently active request
+- Drops RTU responses whose UID, function, expected length, or standard write echo does not match the active request
 - Optional write protection that allows untrusted clients to use only standard read-only functions `0x01`-`0x04`
 - Optional read protection for clients outside trusted networks or trusted DNS hosts
 - Optional rejection of untrusted TCP clients before Modbus traffic starts
@@ -49,7 +49,7 @@ The bridge listens on a configurable TCP port (default: 502) and expects standar
 
 Runtime counters and the related example sensors are aggregated across all configured `modbus_bridge` instances on the same ESP node. They are intended as node-wide diagnostics, not per-bridge counters.
 
-Since version `2026.06.1`, RTU responses are checked against the active request after CRC validation. The bridge verifies matching Unit ID, matching Function Code (or Modbus exception Function Code), and for known response types also the exact expected response length. This prevents stale valid-CRC RTU frames from being forwarded as the response to a newer TCP request. Dropped frames are counted as `RTU Mismatch Drops`.
+Since version `2026.06.1`, RTU responses are checked against the active request after CRC validation. The bridge verifies matching Unit ID, matching Function Code (or Modbus exception Function Code), and for known response types also the exact expected response length. Standard write responses (`0x05`, `0x06`, `0x0F`, `0x10`) must also echo the requested address and value or quantity. Read responses do not contain the requested start address, so an old read response with the same Unit ID, Function Code, and byte count cannot be distinguished from the current response. Dropped frames are counted as `RTU Mismatch Drops`.
 
 When read or write protection is active, untrusted clients are limited to two pending requests, UID `0` broadcasts are dropped, and queued requests from trusted clients are handled before queued untrusted requests. The currently active RTU request is never interrupted.
 

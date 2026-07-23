@@ -254,10 +254,11 @@ namespace esphome
       bool is_reject_untrusted_clients_effective_() const;
       bool is_trusted_client_ipv4_(uint32_t remote_ipv4);
       void refresh_trusted_host_cache_();
-      void send_rtu_request_(PendingRequest &req);
+      bool send_rtu_request_(PendingRequest &req);
+      void abort_pending_after_uart_tx_failure_();
       bool finish_current_and_send_next_();
       void fire_rtu_timeout_for_request_(const PendingRequest &req);
-      void read_uart_response_bytes_(PendingRequest &req);
+      size_t read_uart_response_bytes_(PendingRequest &req);
       void handle_tcp_payload(const uint8_t *data, size_t len, int client_fd);
       bool send_to_client_(int slot, const uint8_t *data, size_t len);
       void purge_client_(size_t idx, std::vector<std::vector<uint8_t>> *accu_opt);
