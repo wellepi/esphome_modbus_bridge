@@ -488,6 +488,6 @@ python modbus_rw.py --serial-port /dev/ttyUSB0 --baudrate 19200 --parity E --reg
 ```
 
 #### Requirements
-- Python 3.x  
-- pymodbus ≤3.9.x library (let me know if you need it compatible with >3.10)
-- Install via: `pip install "pymodbus<3.10"`
+- Python 3.x
+- PyModbus >= 3.10
+- Install via: `pip install "pymodbus>=3.10"`
