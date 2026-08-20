@@ -771,9 +771,7 @@ namespace esphome
     {
       if (this->de_pin_ == nullptr && this->re_pin_ == nullptr)
         return;
-      // ensure last stop bit left the wire
-      if (this->char_time_us_ > 0)
-        delayMicroseconds(this->char_time_us_);
+      // The preceding UART flush guarantees that the final stop bit has left TX.
       this->rs485_set_tx_(false);
     }
 
