@@ -2,10 +2,10 @@ import esphome.codegen as cg
 import esphome.config_validation as cv
 import ipaddress
 from esphome import automation, pins
-from esphome.components import switch, uart
+from esphome.components import socket, switch, uart
 from esphome.const import CONF_ID, CONF_TRIGGER_ID
 
-AUTO_LOAD = ["switch"]
+AUTO_LOAD = ["socket", "switch"]
 
 CONF_TCP_PORT = "tcp_port"
 CONF_TCP_POLL_INTERVAL = "tcp_poll_interval"
@@ -148,8 +148,23 @@ BASE_SCHEMA = cv.All(
     ).extend(cv.COMPONENT_SCHEMA),
 )
 
+def _register_socket_usage(config):
+    # Older ESPHome versions used fixed limits and did not track socket consumers.
+    if not hasattr(socket, "consume_sockets"):
+        return config
+    for conf in config:
+        # One extra accepted connection is needed when all client slots are occupied.
+        clients = conf[CONF_TCP_ALLOWED_CLIENTS] + 1
+        if hasattr(socket, "SocketType"):
+            socket.consume_sockets(clients, "modbus_bridge", socket.SocketType.TCP)(conf)
+            socket.consume_sockets(1, "modbus_bridge", socket.SocketType.TCP_LISTEN)(conf)
+        else:
+            socket.consume_sockets(clients + 1, "modbus_bridge")(conf)
+    return config
+
+
 # Allow a list of bridge definitions under modbus_bridge:
-CONFIG_SCHEMA = cv.ensure_list(BASE_SCHEMA)
+CONFIG_SCHEMA = cv.All(cv.ensure_list(BASE_SCHEMA), _register_socket_usage)
 
 
 async def to_code(config):

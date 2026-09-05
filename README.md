@@ -4,6 +4,7 @@ This ESPHome component provides a transparent Modbus TCP-to-RTU bridge for ESP82
 
 | Version | Changes |
 |---|---|
+| 2026.09.1 | Fixed TCP buffering, RTU echo handling and network recovery; added async trusted-host DNS and socket budgeting |
 | 2026.07.1 | Fixed request queue handling and improved untrusted-client, TCP-send, and RTU-response handling |
 | 2026.06.1 | Drop RTU responses that have valid CRC but do not match the active request |
 | 2026.04.3 | Added CRC-validated RTU echo/noise stripping for known response types |
@@ -50,6 +51,8 @@ The bridge listens on a configurable TCP port (default: 502) and expects standar
 Runtime counters and the related example sensors are aggregated across all configured `modbus_bridge` instances on the same ESP node. They are intended as node-wide diagnostics, not per-bridge counters.
 
 Since version `2026.06.1`, RTU responses are checked against the active request after CRC validation. The bridge verifies matching Unit ID, matching Function Code (or Modbus exception Function Code), and for known response types also the exact expected response length. Standard write responses (`0x05`, `0x06`, `0x0F`, `0x10`) must also echo the requested address and value or quantity. Read responses do not contain the requested start address, so an old read response with the same Unit ID, Function Code, and byte count cannot be distinguished from the current response. Dropped frames are counted as `RTU Mismatch Drops`.
+
+Since `2026.09.1`, discarded RTU echoes or invalid responses no longer advance the request queue: the bridge keeps waiting for a valid matching response until the original timeout. Trusted-host DNS lookups run asynchronously; clients awaiting a trust decision cannot send requests to the RTU bus. Existing clients keep working during DNS resolution.
 
 When read or write protection is active, untrusted clients are limited to two pending requests, UID `0` broadcasts are dropped, and queued requests from trusted clients are handled before queued untrusted requests. The currently active RTU request is never interrupted.
 

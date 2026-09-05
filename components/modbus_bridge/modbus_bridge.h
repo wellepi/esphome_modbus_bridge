@@ -9,6 +9,7 @@
 #include <cstring>
 #include <deque>
 #include <string>
+#include <atomic>
 #include "esphome/core/automation.h" // Brings in CallbackManager & Trigger types transitively
 
 #ifdef USE_ESP8266
@@ -29,6 +30,7 @@ namespace esphome
       uint32_t remote_ipv4 = 0;
       uint16_t remote_port = 0;
       bool trusted = true;
+      bool trust_pending = false;
     };
 #endif
 
@@ -40,6 +42,7 @@ namespace esphome
       uint32_t remote_ipv4 = 0;
       uint16_t remote_port = 0;
       bool trusted = true;
+      bool trust_pending = false;
     };
 #endif
 
@@ -47,6 +50,16 @@ namespace esphome
     {
       uint32_t network = 0;
       uint32_t mask = 0;
+    };
+
+    struct TrustedHostLookup
+    {
+      std::string hostname;
+      uint32_t ipv4{0};
+      uint32_t generation{0};
+      // The DNS callback publishes its result from the lwIP task on ESP32.
+      std::atomic<bool> ready{false};
+      bool active{false};
     };
 
     class ModbusBridgeComponent;
@@ -97,6 +110,7 @@ namespace esphome
       uint32_t start_time = 0;
       size_t last_size = 0; // tracks last observed response size for end-of-frame stability
       uint8_t stable_polls = 0; // consecutive polls with no new UART bytes
+      bool received_bytes = false;
     };
 
     class ModbusBridgeComponent : public Component
@@ -202,6 +216,10 @@ namespace esphome
       std::vector<uint32_t> trusted_host_ipv4_cache_;
       uint32_t trusted_hosts_last_resolve_{0};
       bool trusted_hosts_resolved_{false};
+      bool trusted_hosts_resolving_{false};
+      size_t trusted_host_index_{0};
+      uint32_t trusted_hosts_generation_{0};
+      TrustedHostLookup trusted_host_lookup_;
 
       bool polling_active_{false};
 
@@ -254,10 +272,13 @@ namespace esphome
       bool is_reject_untrusted_clients_effective_() const;
       bool is_trusted_client_ipv4_(uint32_t remote_ipv4);
       void refresh_trusted_host_cache_();
+      void poll_trusted_host_lookup_();
+      bool finish_client_trust_check_(size_t slot);
       bool send_rtu_request_(PendingRequest &req);
       void abort_pending_after_uart_tx_failure_();
       bool finish_current_and_send_next_();
       void fire_rtu_timeout_for_request_(const PendingRequest &req);
+      void check_rtu_timeout_(const PendingRequest &req);
       size_t read_uart_response_bytes_(PendingRequest &req);
       void handle_tcp_payload(const uint8_t *data, size_t len, int client_fd);
       bool send_to_client_(int slot, const uint8_t *data, size_t len);
