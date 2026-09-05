@@ -222,6 +222,10 @@ namespace esphome
       TrustedHostLookup trusted_host_lookup_;
 
       bool polling_active_{false};
+      bool rtu_request_active_{false};
+      bool bus_activity_seen_{false};
+      uint32_t last_bus_activity_us_{0};
+      uint32_t rtu_frame_gap_us_{1750};
 
       // Cached timing for RS-485 toggling
       uint32_t char_time_us_{0};
@@ -250,7 +254,8 @@ namespace esphome
       bool validate_rtu_crc_(const std::vector<uint8_t> &data) const;
       bool validate_rtu_crc_(const uint8_t *data, size_t len) const;
       bool validate_rtu_response_matches_request_(const PendingRequest &pending) const;
-      bool normalize_rtu_response_(PendingRequest &pending);
+      bool validate_rtu_response_matches_request_(const PendingRequest &pending, size_t start, size_t len) const;
+      bool normalize_rtu_response_(PendingRequest &pending, bool &incomplete);
       void initialize_tcp_server_();
       void poll_uart_response_();
       void check_tcp_sockets_();
@@ -274,6 +279,9 @@ namespace esphome
       void refresh_trusted_host_cache_();
       void poll_trusted_host_lookup_();
       bool finish_client_trust_check_(size_t slot);
+      bool drop_protected_request_(uint8_t uid, uint8_t fc, int client_slot);
+      void drain_uart_rx_();
+      bool dispatch_next_request_();
       bool send_rtu_request_(PendingRequest &req);
       void abort_pending_after_uart_tx_failure_();
       bool finish_current_and_send_next_();

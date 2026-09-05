@@ -23,6 +23,7 @@
 
 namespace fake {
 inline uint32_t now = 0;
+inline uint32_t sub_ms = 0;
 struct Connection {
   bool connected = true;
   bool listener = false;
@@ -147,16 +148,35 @@ inline err_t tcpip_try_callback(void (*cb)(void *), void *arg) {
 
 namespace esphome {
 inline uint32_t millis() { return fake::now; }
+inline uint32_t micros() { return fake::now * 1000U + fake::sub_ms; }
 inline void delay(unsigned value) { fake::now += value; }
-inline void delayMicroseconds(unsigned) {}
+inline void delayMicroseconds(unsigned value) {
+  const uint32_t total = fake::sub_ms + value;
+  fake::now += total / 1000; fake::sub_ms = total % 1000;
+}
 class Component {
 public:
   std::map<std::string, std::function<void()>> intervals;
+  struct Timeout { uint32_t due; std::function<void()> callback; };
+  std::map<std::string, Timeout> timeouts;
   virtual ~Component() = default;
   virtual void setup() {}
   void set_interval(const std::string &name, uint32_t, std::function<void()> cb) { intervals[name] = cb; }
   void cancel_interval(const std::string &name) { intervals.erase(name); }
   void run_interval(const std::string &name) { auto cb = intervals.at(name); cb(); }
+  void set_timeout(const std::string &name, uint32_t delay_ms, std::function<void()> cb) {
+    timeouts[name] = {fake::now + delay_ms, cb};
+  }
+  void cancel_timeout(const std::string &name) { timeouts.erase(name); }
+  void run_timeouts() {
+    while (true) {
+      auto it = std::find_if(timeouts.begin(), timeouts.end(), [](const auto &item) {
+        return static_cast<int32_t>(fake::now - item.second.due) >= 0;
+      });
+      if (it == timeouts.end()) return;
+      auto cb = it->second.callback; timeouts.erase(it); cb();
+    }
+  }
 };
 class GPIOPin { public: void setup() {} void digital_write(bool) {} };
 template<class> class CallbackManager;
@@ -171,16 +191,24 @@ class Switch { public: bool state = false; void publish_state(bool value) { stat
 protected: virtual void write_state(bool) = 0; };
 }
 namespace uart {
+enum UARTParityOptions { UART_CONFIG_PARITY_NONE, UART_CONFIG_PARITY_EVEN, UART_CONFIG_PARITY_ODD };
 enum class UARTFlushResult { UART_FLUSH_RESULT_SUCCESS, UART_FLUSH_RESULT_ASSUMED_SUCCESS,
                              UART_FLUSH_RESULT_TIMEOUT, UART_FLUSH_RESULT_FAILED };
 class UARTComponent {
 public:
   std::deque<uint8_t> rx;
   std::vector<std::vector<uint8_t>> tx;
-  uint32_t get_baud_rate() const { return 9600; }
+  std::vector<uint32_t> tx_times;
+  uint32_t baud_rate = 9600;
+  uint8_t data_bits = 8, stop_bits = 1;
+  UARTParityOptions parity = UART_CONFIG_PARITY_NONE;
+  uint32_t get_baud_rate() const { return baud_rate; }
+  uint8_t get_data_bits() const { return data_bits; }
+  uint8_t get_stop_bits() const { return stop_bits; }
+  UARTParityOptions get_parity() const { return parity; }
   size_t available() const { return rx.size(); }
   bool read_byte(uint8_t *b) { if (rx.empty()) return false; *b = rx.front(); rx.pop_front(); return true; }
-  void write_array(const std::vector<uint8_t> &data) { tx.push_back(data); }
+  void write_array(const std::vector<uint8_t> &data) { tx.push_back(data); tx_times.push_back(micros()); }
   UARTFlushResult flush() { return UARTFlushResult::UART_FLUSH_RESULT_SUCCESS; }
 };
 }

@@ -15,6 +15,8 @@ public:
   bool resolving() const { return trusted_hosts_resolving_; }
   bool pending(size_t slot = 0) const { return clients_[slot].trust_pending; }
   bool trusted(size_t slot = 0) const { return clients_[slot].trusted; }
+  bool active() const { return rtu_request_active_; }
+  uint32_t frame_gap_us() const { return rtu_frame_gap_us_; }
   size_t buffered(size_t slot = 0) const {
 #ifdef USE_ESP32
     return rx_accu_[slot].size();
@@ -27,18 +29,23 @@ public:
 struct Fixture {
   uart::UARTComponent uart;
   TestBridge bridge;
-  Fixture() {
+  explicit Fixture(uint32_t baud_rate = 9600, uint8_t stop_bits = 1,
+                   uart::UARTParityOptions parity = uart::UART_CONFIG_PARITY_NONE) {
     fake::now = 0;
+    fake::sub_ms = 0;
     fake::connections.clear(); fake::accepts.clear(); fake::next_fd = 3;
     fake::dns_requests.clear(); fake::dns_tasks.clear(); fake::dns_cached.clear();
     fake::dns_error = false; fake::dns_queue_full = false; fake::logs.clear();
     network::connected = true;
     network::addresses = {}; network::addresses[0].value = 0xC0A80164;
+    uart.baud_rate = baud_rate;
+    uart.stop_bits = stop_bits; uart.parity = parity;
     bridge.set_uart_id(&uart); bridge.setup();
     network_tick();
   }
   void network_tick() { bridge.run_interval("tcp_server_and_network_check"); }
   void poll() { bridge.check_tcp_sockets_(); }
+  void advance(uint32_t at) { fake::now = at; bridge.run_timeouts(); }
   int connect(uint32_t ip = 0xC0A80120) { int fd = fake::client(ip); poll(); return fd; }
   void incoming(int fd, const std::vector<uint8_t> &data) {
     auto &rx = fake::connections[fd].rx; rx.insert(rx.end(), data.begin(), data.end());
@@ -90,9 +97,10 @@ static void test_echo_and_delayed_response() {
   f.receive(echo, 7); f.settle(14);
   assert(f.uart.tx.size() == 1 && f.bridge.active_tid() == 1);
   f.receive({1,4,2,0,0xA7,0xF8,0x8A}, 50);
-  assert(f.uart.tx.size() == 2 && f.bridge.active_tid() == 2);
+  assert(f.uart.tx.size() == 1 && f.bridge.active_tid() == 2);
   const auto &reply = fake::connections[fd].tx;
   assert((reply == std::vector<uint8_t>{0,1,0,0,0,5,1,4,2,0,0xA7}));
+  f.advance(55); assert(f.uart.tx.size() == 2);
 }
 
 static void test_invalid_responses_keep_deadline() {
@@ -137,6 +145,7 @@ static void test_network_recovery() {
   f.network_tick(); assert(!f.bridge.running());
   network::connected = true; f.network_tick(); assert(f.bridge.running());
   int next = f.connect(); f.incoming(next, request(2)); f.poll(); assert(f.bridge.active_tid() == 2);
+  f.advance(5); assert(f.bridge.active());
 }
 
 static void test_dns_pending_and_existing_client() {
@@ -185,14 +194,240 @@ static void test_dns_multiple_and_immediate() {
   f.incoming(remote, request(1)); f.poll(); assert(f.uart.tx.size() == 1);
 }
 
+static void test_echo_before_exception() {
+  for (bool swapped : {false, true}) {
+    Fixture f; f.bridge.set_crc_bytes_swapped(swapped);
+    int fd = f.connect(); auto req = request(1);
+    req[8] = 0x90; req[9] = 0; req[11] = 72;
+    f.incoming(fd, req); f.poll();
+    auto capture = f.uart.tx.front();
+    auto exception = with_crc({1,0x84,2});
+    if (swapped) std::swap(exception[3], exception[4]);
+    capture.insert(capture.end(), exception.begin(), exception.end());
+    f.receive(capture, 10); f.settle(17);
+    assert(f.bridge.queued() == 0);
+    assert((fake::connections[fd].tx == std::vector<uint8_t>{0,1,0,0,0,3,1,0x84,2}));
+  }
+}
+
+static void test_stale_write_before_matching_reply() {
+  for (uint8_t fc : {uint8_t(5), uint8_t(6), uint8_t(15), uint8_t(16)}) {
+    for (bool wrong_address : {false, true}) {
+      Fixture f; int fd = f.connect(); auto req = request(1,fc);
+      if (fc == 5) { req[10] = 0xFF; req[11] = 0; }
+      if (fc == 15) { req[5] = 8; req.insert(req.end(), {1,1}); }
+      if (fc == 16) { req[5] = 9; req.insert(req.end(), {2,0,1}); }
+      f.incoming(fd, req); f.poll();
+      auto current = with_crc({1,fc,req[8],req[9],req[10],req[11]});
+      auto stale = std::vector<uint8_t>(current.begin(), current.end() - 2);
+      ++stale[wrong_address ? 3 : 5];
+      auto capture = with_crc(stale);
+      capture.insert(capture.end(), current.begin(), current.end());
+      f.receive(capture, 10); f.settle(17);
+      assert(f.bridge.queued() == 0);
+      auto expected = std::vector<uint8_t>{0,1,0,0,0,6};
+      expected.insert(expected.end(), current.begin(), current.end() - 2);
+      assert(fake::connections[fd].tx == expected);
+    }
+  }
+}
+
+static void test_partial_noisy_response() {
+  Fixture f; int fd = f.connect(); f.incoming(fd, request(1)); f.poll();
+  const auto reply = with_crc({1,4,2,0,42});
+  std::vector<uint8_t> capture{0x55,0xAA};
+  capture.insert(capture.end(), reply.begin(), reply.begin() + 4);
+  f.receive(capture, 10); f.settle(17);
+  assert(f.bridge.queued() == 1 && fake::connections[fd].tx.empty());
+  f.receive({reply.begin() + 4, reply.end()}, 50); f.settle(57);
+  assert(f.bridge.queued() == 0 && fake::connections[fd].tx.size() == 11);
+}
+
+static void test_bad_crc_candidate_and_trailing_noise() {
+  Fixture f; int fd = f.connect(); f.incoming(fd, request(1)); f.poll();
+  const auto reply = with_crc({1,4,2,0,42});
+  auto capture = reply; capture.back() ^= 1;
+  capture.insert(capture.end(), reply.begin(), reply.end());
+  capture.insert(capture.end(), {0x55,0xAA,0xFF});
+  f.receive(capture, 10); f.settle(17);
+  assert(f.bridge.queued() == 0 && fake::connections[fd].tx.size() == 11);
+}
+
+static void test_partial_noise_keeps_original_timeout() {
+  Fixture f; int fd = f.connect(); f.incoming(fd, request(1)); f.poll();
+  const auto before = f.bridge.get_timeouts();
+  f.receive({0x55,1,4,2,0}, 900); f.settle(907);
+  assert(f.bridge.active());
+  f.advance(1001); f.bridge.poll_uart_response_();
+  assert(f.bridge.queued() == 0 && f.bridge.get_timeouts() == before + 1);
+}
+
+static void test_unknown_function_unchanged() {
+  Fixture f; int fd = f.connect(); f.incoming(fd, request(1,0x41)); f.poll();
+  auto reply = with_crc({1,0x41,0xCA,0xFE,0,0x42});
+  f.receive(reply, 10); f.settle(17);
+  assert(f.bridge.queued() == 0);
+  assert((fake::connections[fd].tx == std::vector<uint8_t>{0,1,0,0,0,6,1,0x41,0xCA,0xFE,0,0x42}));
+}
+
+static void test_bus_gap_and_immediate_tcp_reply() {
+  for (uint32_t baud : {9600U,19200U,115200U}) {
+    Fixture f(baud); int fd = f.connect();
+    f.incoming(fd, request(1)); f.incoming(fd, request(2)); f.poll();
+    f.receive(with_crc({1,4,2,0,42}), 20);
+    assert(!fake::connections[fd].tx.empty());
+    assert(fake::now == 20 && f.uart.tx.size() == 1 && !f.bridge.active());
+    uint32_t wait_ms = (f.bridge.frame_gap_us() + 999) / 1000;
+    assert(wait_ms == (baud == 9600 ? 5U : (baud == 19200 ? 3U : 2U)));
+    f.advance(20 + wait_ms - 1); assert(f.uart.tx.size() == 1);
+    f.advance(20 + wait_ms); assert(f.uart.tx.size() == 2 && f.bridge.active());
+    assert(f.uart.tx_times.back() - 20000U >= f.bridge.frame_gap_us());
+  }
+}
+
+static void test_bus_gap_for_new_request_and_late_bytes() {
+  Fixture f; int fd = f.connect(); f.incoming(fd, request(1)); f.poll();
+  f.receive(with_crc({1,4,2,0,42}), 20);
+  f.incoming(fd, request(2)); f.poll(); assert(f.uart.tx.size() == 1);
+  f.uart.rx.push_back(0x55);
+  f.advance(25); assert(f.uart.tx.size() == 1 && f.uart.rx.empty());
+  f.advance(29); assert(f.uart.tx.size() == 1);
+  f.advance(30); assert(f.uart.tx.size() == 2);
+}
+
+static void test_bus_gap_with_parity_and_two_stop_bits() {
+  Fixture f(1200,2,uart::UART_CONFIG_PARITY_EVEN);
+  int fd = f.connect(); f.incoming(fd, request(1)); f.incoming(fd, request(2)); f.poll();
+  f.receive(with_crc({1,4,2,0,42}), 100);
+  assert(f.bridge.frame_gap_us() == 35000);
+  f.advance(134); assert(f.uart.tx.size() == 1);
+  f.advance(135); assert(f.uart.tx.size() == 2);
+}
+
+static void test_bus_gap_micros_wrap() {
+  Fixture f; int fd = f.connect(); f.incoming(fd, request(1)); f.incoming(fd, request(2)); f.poll();
+  const uint32_t at = 4294966;
+  f.receive(with_crc({1,4,2,0,42}), at);
+  assert(f.uart.tx.size() == 1);
+  f.advance(at + 4); assert(f.uart.tx.size() == 1);
+  f.advance(at + 5); assert(f.uart.tx.size() == 2);
+  assert(f.uart.tx_times.back() - at * 1000U >= f.bridge.frame_gap_us());
+}
+
+static void test_disable_cancels_scheduled_tx() {
+  Fixture f; int fd = f.connect(); f.incoming(fd, request(1)); f.incoming(fd, request(2)); f.poll();
+  f.receive(with_crc({1,4,2,0,42}), 20);
+  f.bridge.set_enabled(false); f.advance(30);
+  assert(f.bridge.queued() == 0 && f.uart.tx.size() == 1 && f.bridge.timeouts.empty());
+}
+
+static void test_disconnect_before_scheduled_tx() {
+  Fixture f; int fd = f.connect(); f.incoming(fd, request(1)); f.incoming(fd, request(2)); f.poll();
+  f.receive(with_crc({1,4,2,0,42}), 20);
+  fake::connections[fd].connected = false; f.poll(); f.advance(30);
+  assert(f.bridge.queued() == 0 && f.uart.tx.size() == 1);
+}
+
+static void test_protection_rechecked_at_dispatch() {
+  for (uint8_t fc : {uint8_t(4), uint8_t(6)}) {
+    for (bool toggle_during_gap : {false, true}) {
+      Fixture f; f.bridge.add_trusted_network(0xC0A80100, 0xFFFFFF00);
+      int local = f.connect(); int remote = f.connect(0xCB007109);
+      f.incoming(local, request(1)); f.poll();
+      f.incoming(remote, request(2,fc)); f.poll();
+      auto before = fc == 4 ? f.bridge.get_drop_untrusted_reads() : f.bridge.get_drop_untrusted_writes();
+      if (toggle_during_gap) f.receive(with_crc({1,4,2,0,42}), 20);
+      if (fc == 4) f.bridge.set_protect_reads_for_untrusted_clients(true);
+      else f.bridge.set_protect_writes_for_untrusted_clients(true);
+      if (!toggle_during_gap) f.receive(with_crc({1,4,2,0,42}), 20);
+      f.advance(25);
+      auto after = fc == 4 ? f.bridge.get_drop_untrusted_reads() : f.bridge.get_drop_untrusted_writes();
+      assert(f.uart.tx.size() == 1 && f.bridge.queued() == 0 && after == before + 1);
+      assert(fake::connections[remote].tx.empty());
+    }
+  }
+}
+
+static void test_protection_without_trust_rules() {
+  Fixture f; int fd = f.connect();
+  f.incoming(fd, request(1)); f.incoming(fd, request(2,6)); f.poll();
+  f.bridge.set_protect_writes_for_untrusted_clients(true);
+  f.receive(with_crc({1,4,2,0,42}), 20); f.advance(25);
+  assert(f.uart.tx.size() == 2 && f.uart.tx.back()[1] == 6);
+}
+
+static void test_active_request_not_cancelled_by_protection() {
+  Fixture f; f.bridge.add_trusted_network(0xC0A80100, 0xFFFFFF00);
+  int remote = f.connect(0xCB007109); f.incoming(remote, request(1,6)); f.poll();
+  f.bridge.set_protect_writes_for_untrusted_clients(true);
+  f.receive(f.uart.tx.front(), 20);
+  assert(f.bridge.queued() == 0 && fake::connections[remote].tx.size() == 12);
+}
+
+static void test_invalid_tcp_lengths_counted_once() {
+  for (uint16_t len : {uint16_t(0), uint16_t(1), uint16_t(255), uint16_t(65535)}) {
+    Fixture f; int fd = f.connect(); auto req = request(1);
+    req[4] = len >> 8; req[5] = len & 255;
+    auto before = f.bridge.get_drops_tcp_len();
+    f.incoming(fd, {req.begin(), req.begin() + 5}); f.poll();
+    assert(f.bridge.get_drops_tcp_len() == before);
+    f.incoming(fd, {req.begin() + 5, req.end()}); f.poll(); f.poll();
+    assert(f.bridge.get_drops_tcp_len() == before + 1 && f.uart.tx.empty());
+    f.incoming(fd, request(2)); f.poll(); assert(f.uart.tx.size() == 1);
+  }
+}
+
+static void test_trusted_priority_during_bus_gap() {
+  Fixture f; f.bridge.add_trusted_network(0xC0A80100, 0xFFFFFF00);
+  f.bridge.set_protect_writes_for_untrusted_clients(true);
+  int local = f.connect(); int remote = f.connect(0xCB007109);
+  f.incoming(local, request(1)); f.poll();
+  f.incoming(remote, request(2)); f.poll();
+  f.receive(with_crc({1,4,2,0,42}), 20);
+  assert(!f.bridge.active() && f.bridge.active_tid() == 2);
+  f.incoming(local, request(3)); f.poll();
+  f.advance(25);
+  assert(f.bridge.active() && f.bridge.active_tid() == 3 && f.uart.tx.size() == 2);
+}
+
+static void test_disconnect_preserves_inflight_request() {
+  Fixture f; int first = f.connect(); int second = f.connect(0xC0A80121);
+  f.incoming(first, request(1)); f.poll(); f.incoming(second, request(2)); f.poll();
+  fake::connections[first].connected = false; f.poll();
+  assert(f.bridge.active() && f.bridge.active_tid() == 1);
+  f.receive(with_crc({1,4,2,0,42}), 20);
+  assert(fake::connections[second].tx.empty() && f.uart.tx.size() == 1);
+  f.advance(25); assert(f.bridge.active_tid() == 2 && f.uart.tx.size() == 2);
+}
+
+static void test_automation_disables_bridge() {
+  for (bool on_send : {true, false}) {
+    Fixture f; int fd = f.connect();
+    auto disable = [&f](int, int) { f.bridge.set_enabled(false); };
+    if (on_send) f.bridge.add_on_rtu_send_callback(disable);
+    else f.bridge.add_on_rtu_receive_callback(disable);
+    f.incoming(fd, request(1)); f.incoming(fd, request(2)); f.poll();
+    if (!on_send) f.receive(with_crc({1,4,2,0,42}), 20);
+    f.advance(30);
+    assert(!f.bridge.is_enabled() && !f.bridge.active() && f.bridge.queued() == 0 && f.uart.tx.size() == 1);
+  }
+}
+
 int main() {
   test_tcp_buffer(); test_tcp_fragments(); test_echo_and_delayed_response();
   test_invalid_responses_keep_deadline(); test_valid_write_and_exception(); test_no_response_and_incomplete();
   test_network_recovery(); test_dns_pending_and_existing_client(); test_dns_failure_and_cache();
   test_dns_shutdown_and_reuse(); test_dns_multiple_and_immediate();
+  test_echo_before_exception(); test_stale_write_before_matching_reply(); test_partial_noisy_response();
+  test_bad_crc_candidate_and_trailing_noise(); test_partial_noise_keeps_original_timeout(); test_unknown_function_unchanged();
+  test_bus_gap_and_immediate_tcp_reply(); test_bus_gap_for_new_request_and_late_bytes(); test_bus_gap_micros_wrap();
+  test_bus_gap_with_parity_and_two_stop_bits();
+  test_disable_cancels_scheduled_tx(); test_disconnect_before_scheduled_tx(); test_protection_rechecked_at_dispatch();
+  test_protection_without_trust_rules(); test_active_request_not_cancelled_by_protection(); test_invalid_tcp_lengths_counted_once();
+  test_trusted_priority_during_bus_gap(); test_disconnect_preserves_inflight_request(); test_automation_disables_bridge();
 #ifdef USE_ESP32
-  puts("ESP32: 11 bridge regression tests passed");
+  puts("ESP32: 30 bridge regression tests passed");
 #else
-  puts("ESP8266: 11 bridge regression tests passed");
+  puts("ESP8266: 30 bridge regression tests passed");
 #endif
 }

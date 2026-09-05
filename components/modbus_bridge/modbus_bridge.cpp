@@ -143,13 +143,21 @@ namespace esphome
       req.stable_polls = 0;
     }
 
-    // Drain UART RX (templated to avoid pulling specific UART headers here)
-    template <typename U>
-    static inline void drain_uart_rx(U *u)
+    void ModbusBridgeComponent::drain_uart_rx_()
     {
+      if (this->uart_ == nullptr)
+        return;
       uint8_t b;
-      while (u && u->available())
-        u->read_byte(&b);
+      bool received = false;
+      // Bound each drain so a noisy bus cannot monopolize the main loop.
+      const size_t available = this->uart_->available();
+      for (size_t i = 0; i < available && this->uart_->read_byte(&b); ++i)
+        received = true;
+      if (received)
+      {
+        this->last_bus_activity_us_ = micros();
+        this->bus_activity_seen_ = true;
+      }
     }
 
     enum class BridgeUartFlushResult : uint8_t
@@ -285,11 +293,8 @@ namespace esphome
       }
     }
 
-    static inline bool write_response_echo_matches_request_(const PendingRequest &pending)
+    static inline bool write_response_echo_matches_request_(const PendingRequest &pending, const uint8_t *response, size_t len)
     {
-      if (pending.rtu_data.size() < 6 || pending.response.size() < 6)
-        return false;
-
       switch (pending.rtu_data[1])
       {
       case 0x05:
@@ -297,8 +302,8 @@ namespace esphome
       case 0x0F:
       case 0x10:
         // Standard write responses echo start address plus value or quantity.
-        return std::equal(pending.rtu_data.begin() + 2, pending.rtu_data.begin() + 6,
-                          pending.response.begin() + 2);
+        return pending.rtu_data.size() >= 6 && len >= 6 &&
+               std::equal(pending.rtu_data.begin() + 2, pending.rtu_data.begin() + 6, response + 2);
       default:
         return true;
       }
@@ -525,6 +530,8 @@ namespace esphome
         // If LEN is clearly invalid, drop accumulator to recover from poison
         if (len_field < 2 || len_field > MODBUS_TCP_LEN_CAP)
         {
+          ++g_drops_tcp_len;
+          ESP_LOGW(TAG, "Invalid Modbus TCP length %u, dropping buffer client_id=%d", (unsigned)len_field, client_slot);
           accu.clear();
           return;
         }
@@ -592,7 +599,7 @@ namespace esphome
         (*accu_opt)[idx].clear();
 
       auto it = this->pending_requests_.begin();
-      if (it != this->pending_requests_.end() && it->client_fd == static_cast<int>(idx))
+      if (this->rtu_request_active_ && it != this->pending_requests_.end() && it->client_fd == static_cast<int>(idx))
       {
         // The queue head has already been sent on RTU. Keep it until response or
         // timeout so late bytes cannot be mistaken for the next queued request.
@@ -600,7 +607,8 @@ namespace esphome
         ++it;
       }
 
-      // Requests behind the queue head have not been sent and can be removed.
+      // All remaining requests are unsent and can be removed, including a head
+      // still waiting for the inter-frame gap.
       while (it != this->pending_requests_.end())
       {
         if (it->client_fd == static_cast<int>(idx))
@@ -609,7 +617,10 @@ namespace esphome
           ++it;
       }
       if (this->pending_requests_.empty())
+      {
+        this->cancel_timeout("modbus_tx");
         this->stop_uart_polling_();
+      }
     }
 
     void ModbusBridgeComponent::record_tcp_client_connected_()
@@ -880,6 +891,11 @@ namespace esphome
 
       // Cache char time; setup optional RS-485 pin
       this->char_time_us_ = calc_char_time_us_(_br_setup_guard);
+      // Above 19200 baud Modbus recommends a fixed 1.75 ms inter-frame gap.
+      const uint32_t bits_per_char = std::max<uint32_t>(11, 1 + this->uart_->get_data_bits() +
+          this->uart_->get_stop_bits() + (this->uart_->get_parity() != uart::UART_CONFIG_PARITY_NONE));
+      this->rtu_frame_gap_us_ = _br_setup_guard > 19200 ? 1750 :
+          static_cast<uint32_t>((bits_per_char * 3500000ULL + _br_setup_guard - 1) / _br_setup_guard);
 
       // Optional RS-485 DE and /RE pins
       // Drive both with the same level so it works if they are separate GPIOs or the same GPIO is used for both.
@@ -1066,9 +1082,10 @@ namespace esphome
 #endif
 
       this->pending_requests_.clear();
+      this->rtu_request_active_ = false;
+      this->cancel_timeout("modbus_tx");
       this->stop_uart_polling_();
-      if (this->uart_ != nullptr)
-        drain_uart_rx(this->uart_);
+      this->drain_uart_rx_();
 
       if (this->tcp_server_running_)
       {
@@ -1080,6 +1097,32 @@ namespace esphome
         this->tcp_client_count_ = 0;
         this->tcp_clients_changed_cb_.call(0);
       }
+    }
+
+    bool ModbusBridgeComponent::drop_protected_request_(uint8_t uid, uint8_t fc, int client_slot)
+    {
+      if (this->is_client_slot_trusted_(client_slot))
+        return false;
+      const bool protect_reads = this->is_read_protection_effective_();
+      const bool protect_writes = this->is_write_protection_effective_();
+      const bool read_only = is_modbus_read_only_fc_(fc);
+      const char *reason = nullptr;
+      if ((protect_reads || protect_writes) && uid == 0)
+        reason = "broadcast UID 0";
+      else if (protect_reads && read_only)
+        reason = "read";
+      else if (protect_writes && !read_only)
+        reason = "unsafe function";
+      if (reason == nullptr)
+        return false;
+
+      if (read_only)
+        ++g_drop_untrusted_reads;
+      else
+        ++g_drop_untrusted_writes;
+      if (this->debug_)
+        ESP_LOGW(TAG, "Dropping untrusted Modbus %s FC 0x%02X from client_id=%d", reason, fc, client_slot);
+      return true;
     }
 
     void ModbusBridgeComponent::handle_tcp_payload(const uint8_t *data, size_t len, int client_fd)
@@ -1137,37 +1180,8 @@ namespace esphome
       const bool protect_reads = this->is_read_protection_effective_();
       const bool protect_writes = this->is_write_protection_effective_();
       const bool protected_mode = protect_reads || protect_writes;
-      const bool read_only = is_modbus_read_only_fc_(fc);
-
-      // UID 0 is an RTU broadcast and cannot produce a response. Do not let an
-      // untrusted client occupy the bus until timeout when protection is active.
-      if (!trusted && protected_mode && uid == 0)
-      {
-        if (read_only)
-          g_drop_untrusted_reads++;
-        else
-          g_drop_untrusted_writes++;
-        if (this->debug_)
-          ESP_LOGW(TAG, "Dropping untrusted Modbus broadcast UID 0 FC 0x%02X from client_id=%d", fc, client_fd);
+      if (this->drop_protected_request_(uid, fc, client_fd))
         return;
-      }
-
-      if (!trusted && protect_reads && read_only)
-      {
-        g_drop_untrusted_reads++;
-        if (this->debug_)
-          ESP_LOGW(TAG, "Dropping untrusted Modbus read FC 0x%02X from client_id=%d", fc, client_fd);
-        return;
-      }
-      // In protected mode, only the explicitly read-only standard functions are
-      // safe. This also blocks write-capable, diagnostic, and unknown FCs.
-      if (!trusted && protect_writes && !read_only)
-      {
-        g_drop_untrusted_writes++;
-        if (this->debug_)
-          ESP_LOGW(TAG, "Dropping untrusted Modbus unsafe FC 0x%02X from client_id=%d", fc, client_fd);
-        return;
-      }
 
       if (!trusted && protected_mode)
       {
@@ -1194,7 +1208,8 @@ namespace esphome
         if (trusted && protected_mode && !this->pending_requests_.empty())
         {
           auto it = this->pending_requests_.begin();
-          ++it; // never remove the active RTU request
+          if (this->rtu_request_active_)
+            ++it; // never remove a request already sent on RTU
           for (; it != this->pending_requests_.end(); ++it)
           {
             if (!it->trusted_client)
@@ -1250,11 +1265,11 @@ namespace esphome
       req.last_size = 0; // ensure deterministic timeout logic
       req.stable_polls = 0;
       g_frames_in++;
-      const bool start_immediately = this->pending_requests_.empty();
-      if (trusted && protected_mode && !start_immediately)
+      if (trusted && protected_mode && !this->pending_requests_.empty())
       {
         auto insert_at = this->pending_requests_.begin();
-        ++insert_at; // the active request always remains first
+        if (this->rtu_request_active_)
+          ++insert_at; // a request already on the bus always remains first
         while (insert_at != this->pending_requests_.end() && insert_at->trusted_client)
           ++insert_at;
         this->pending_requests_.insert(insert_at, std::move(req));
@@ -1264,19 +1279,7 @@ namespace esphome
         this->pending_requests_.push_back(std::move(req));
       }
 
-      if (start_immediately)
-      {
-        PendingRequest &cur = this->pending_requests_.front();
-        if (this->send_rtu_request_(cur))
-        {
-          if (!this->pending_requests_.empty())
-            this->start_uart_polling_();
-        }
-        else
-        {
-          this->abort_pending_after_uart_tx_failure_();
-        }
-      }
+      this->dispatch_next_request_();
     }
 
     void ModbusBridgeComponent::update_tcp_client_count_()
@@ -1768,11 +1771,12 @@ namespace esphome
                  transaction_id_from_header_(req.header));
         return false;
       }
-      drain_uart_rx(this->uart_);
       this->rs485_begin_tx_();
       this->uart_->write_array(req.rtu_data);
       flush_result = flush_uart_tx_(this->uart_);
       this->rs485_end_tx_();
+      this->last_bus_activity_us_ = micros();
+      this->bus_activity_seen_ = true;
       if (flush_result != BridgeUartFlushResult::SUCCESS)
       {
         ESP_LOGE(TAG, "UART flush %s after RTU write; transmission may be incomplete. client_id=%d tid=0x%04X",
@@ -1798,35 +1802,61 @@ namespace esphome
     {
       const size_t dropped = this->pending_requests_.size();
       this->pending_requests_.clear();
+      this->rtu_request_active_ = false;
+      this->cancel_timeout("modbus_tx");
       this->stop_uart_polling_();
-      drain_uart_rx(this->uart_);
+      this->drain_uart_rx_();
       ESP_LOGW(TAG, "Aborted %u pending Modbus request(s) after UART TX failure", (unsigned)dropped);
     }
 
     bool ModbusBridgeComponent::finish_current_and_send_next_()
     {
-      if (!this->pending_requests_.empty())
+      if (this->rtu_request_active_ && !this->pending_requests_.empty())
         this->pending_requests_.pop_front();
+      this->rtu_request_active_ = false;
+      this->stop_uart_polling_();
+      return this->dispatch_next_request_();
+    }
 
+    bool ModbusBridgeComponent::dispatch_next_request_()
+    {
+      if (this->rtu_request_active_)
+        return true;
+      this->cancel_timeout("modbus_tx");
       while (!this->pending_requests_.empty())
       {
         auto &next = this->pending_requests_.front();
-        if (!this->is_client_slot_connected_(next.client_fd))
+        if (!this->is_client_slot_connected_(next.client_fd) ||
+            this->drop_protected_request_(next.rtu_data[0], next.rtu_data[1], next.client_fd))
         {
           this->pending_requests_.pop_front();
           continue;
         }
+
+        // Observe/drain late bytes before starting a new transaction. UART APIs
+        // do not expose their wire timestamp, so use the last observed activity.
+        this->drain_uart_rx_();
+        const uint32_t idle_us = micros() - this->last_bus_activity_us_;
+        if (this->bus_activity_seen_ && idle_us < this->rtu_frame_gap_us_)
+        {
+          const uint32_t wait_ms = (this->rtu_frame_gap_us_ - idle_us + 999) / 1000;
+          this->set_timeout("modbus_tx", wait_ms, [this]() { this->dispatch_next_request_(); });
+          return true;
+        }
+
+        this->rtu_request_active_ = true;
         if (!this->send_rtu_request_(next))
         {
           this->abort_pending_after_uart_tx_failure_();
           return false;
         }
-        if (this->pending_requests_.empty())
+        if (!this->rtu_request_active_ || this->pending_requests_.empty())
         {
           // An on_rtu_send automation may disable the bridge and clear the queue.
           this->stop_uart_polling_();
           return false;
         }
+        this->start_uart_polling_();
         return true;
       }
 
@@ -1871,12 +1901,14 @@ namespace esphome
                                    : 0;
       req.response.reserve(req.response.size() + std::min(avail, remaining));
       size_t discarded = 0;
+      bool received = false;
       for (size_t i = 0; i < avail; ++i)
       {
         uint8_t b;
         if (this->uart_->read_byte(&b))
         {
           req.received_bytes = true;
+          received = true;
           if (req.response.size() < kMaxRtuCapture)
             req.response.push_back(b);
           else
@@ -1884,6 +1916,11 @@ namespace esphome
         }
         else
           break;
+      }
+      if (received)
+      {
+        this->last_bus_activity_us_ = micros();
+        this->bus_activity_seen_ = true;
       }
       return discarded;
     }
@@ -1907,7 +1944,7 @@ namespace esphome
 
     void ModbusBridgeComponent::poll_uart_response_()
     {
-      if (this->pending_requests_.empty())
+      if (!this->rtu_request_active_ || this->pending_requests_.empty())
       {
         this->stop_uart_polling_();
         return;
@@ -1949,14 +1986,26 @@ namespace esphome
       const uint8_t kStablePollsRequired = 2;
       size_t expected_len = 0;
       const bool known_length = expected_known_rtu_response_length_(pending, 0, &expected_len);
-      const bool known_frame_incomplete = known_length && current_size < expected_len;
       const bool complete_known_frame = known_length && current_size == expected_len &&
+                                        this->validate_rtu_response_matches_request_(pending) &&
                                         this->validate_rtu_crc_(pending.response);
 
-      // Clean responses with a known shape can be handled immediately. Size
-      // stability remains the fallback for unknown FCs and echo/noise buffers.
-      if ((complete_known_frame || pending.stable_polls >= kStablePollsRequired) && !known_frame_incomplete)
+      // Clean responses take the fast path. Search each unchanged noisy buffer
+      // once after it settles, and once more at the original deadline.
+      const bool timed_out = millis() - pending.start_time > this->rtu_response_timeout_ms_;
+      if (complete_known_frame || pending.stable_polls == kStablePollsRequired || timed_out)
       {
+        bool incomplete = false;
+        const bool normalized = !complete_known_frame && this->normalize_rtu_response_(pending, incomplete);
+        // A misleading echo header must not hide a complete response later in
+        // the buffer. If no complete candidate exists, retain partial data.
+        if (!complete_known_frame && !normalized &&
+            (incomplete || (timed_out && pending.stable_polls < kStablePollsRequired)))
+        {
+          this->check_rtu_timeout_(pending);
+          return;
+        }
+        current_size = pending.response.size();
         if (this->debug_)
         {
           std::string debug_output = to_hex(pending.response);
@@ -1966,10 +2015,7 @@ namespace esphome
             ESP_LOGD(TAG, "RTU recv (stable %u polls, %d bytes): %s",
                      (unsigned)pending.stable_polls, (int)current_size, debug_output.c_str());
         }
-        bool crc_valid = complete_known_frame;
-        if (!complete_known_frame && this->normalize_rtu_response_(pending))
-          crc_valid = true; // normalization only accepts a frame with valid CRC
-        current_size = pending.response.size();
+        bool crc_valid = complete_known_frame || normalized;
         if (current_size < 5)
         {
           INC(g_drops_rtu_incomplete);
@@ -1989,7 +2035,7 @@ namespace esphome
           this->check_rtu_timeout_(pending);
           return;
         }
-        if (!this->validate_rtu_response_matches_request_(pending))
+        if (!complete_known_frame && !normalized && !this->validate_rtu_response_matches_request_(pending))
         {
           INC(g_drops_rtu_mismatch);
           ESP_LOGW(TAG, "RTU response does not match request. Dropping response. client_id=%d req_uid=%u req_fc=0x%02X bytes=%s",
@@ -2079,9 +2125,14 @@ namespace esphome
 
     bool ModbusBridgeComponent::validate_rtu_response_matches_request_(const PendingRequest &pending) const
     {
-      const auto &response = pending.response;
-      if (pending.rtu_data.size() < 2 || response.size() < 5)
+      return this->validate_rtu_response_matches_request_(pending, 0, pending.response.size());
+    }
+
+    bool ModbusBridgeComponent::validate_rtu_response_matches_request_(const PendingRequest &pending, size_t start, size_t len) const
+    {
+      if (pending.rtu_data.size() < 2 || len < 5 || start > pending.response.size() || len > pending.response.size() - start)
         return false;
+      const uint8_t *response = pending.response.data() + start;
 
       const uint8_t request_uid = pending.rtu_data[0];
       const uint8_t request_fc = pending.rtu_data[1];
@@ -2094,13 +2145,13 @@ namespace esphome
         return false;
 
       size_t expected_len = 0;
-      if (expected_known_rtu_response_length_(pending, 0, &expected_len))
+      if (expected_known_rtu_response_length_(pending, start, &expected_len))
       {
-        if (expected_len != response.size())
+        if (expected_len != len)
           return false;
         if (response_fc == (request_fc | 0x80))
           return true;
-        return write_response_echo_matches_request_(pending);
+        return write_response_echo_matches_request_(pending, response, len);
       }
       if (has_known_response_shape_(request_fc))
         return false;
@@ -2110,22 +2161,33 @@ namespace esphome
       return true;
     }
 
-    bool ModbusBridgeComponent::normalize_rtu_response_(PendingRequest &pending)
+    bool ModbusBridgeComponent::normalize_rtu_response_(PendingRequest &pending, bool &incomplete)
     {
+      incomplete = false;
       auto &response = pending.response;
-      if (pending.rtu_data.size() < 2 || response.size() < 5)
+      if (pending.rtu_data.size() < 2 || response.size() < 2)
         return false;
 
       const uint8_t expected_uid = pending.rtu_data[0];
-      for (size_t start = 0; start + 5 <= response.size(); ++start)
+      for (size_t start = 0; start + 2 <= response.size(); ++start)
       {
         if (response[start] != expected_uid)
           continue;
 
         size_t frame_len = 0;
         if (!expected_known_rtu_response_length_(pending, start, &frame_len))
+        {
+          if (response.size() - start < 3 && response[start + 1] == pending.rtu_data[1] &&
+              has_known_response_shape_(pending.rtu_data[1]))
+            incomplete = true;
           continue;
-        if (frame_len < 5 || frame_len > response.size() - start)
+        }
+        if (frame_len > response.size() - start)
+        {
+          incomplete = true;
+          continue;
+        }
+        if (!this->validate_rtu_response_matches_request_(pending, start, frame_len))
           continue;
         if (!this->validate_rtu_crc_(response.data() + start, frame_len))
           continue;
@@ -2133,7 +2195,7 @@ namespace esphome
         const size_t leading = start;
         const size_t trailing = response.size() - start - frame_len;
         if (leading == 0 && trailing == 0)
-          return false;
+          return true;
 
         if (trailing > 0)
           response.erase(response.begin() + start + frame_len, response.end());
