@@ -2,7 +2,10 @@
 # Waveshare ESP32-S3-RS485-CAN — Modbus TCP-to-RTU Gateway
 # ============================================================================
 # Board: Waveshare ESP32-S3-RS485-CAN
+# Board: Waveshare ESP32-S3-RS485-CAN
 #   https://www.waveshare.com/wiki/ESP32-S3-RS485-CAN
+#   (also sold as "ESP32-S3-RS485-CAN Industrial Control Board" on
+#   AliExpress/resellers, DIN-rail mountable)
 #
 # Purpose: turns this board into a real Modbus TCP-to-RTU gateway (like an
 # Elfin EW11 in "Modbus TCP Gateway" mode) using the esphome_modbus_bridge
