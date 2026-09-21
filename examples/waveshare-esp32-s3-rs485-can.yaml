@@ -2,7 +2,6 @@
 # Waveshare ESP32-S3-RS485-CAN — Modbus TCP-to-RTU Gateway
 # ============================================================================
 # Board: Waveshare ESP32-S3-RS485-CAN
-# Board: Waveshare ESP32-S3-RS485-CAN
 #   https://www.waveshare.com/wiki/ESP32-S3-RS485-CAN
 #   (also sold as "ESP32-S3-RS485-CAN Industrial Control Board" on
 #   AliExpress/resellers, DIN-rail mountable)
@@ -27,7 +26,6 @@
 #                                    bus, even with correct wiring)
 #
 # Tested with: Marstek Venus C battery, Modbus RTU, 115200 8N1
-#
 # Wiring notes:
 #   Power: this board is powered externally (DC 7-36V into its own power
 #   terminals), NOT parasitically from the Marstek's RS485 port. Use a
